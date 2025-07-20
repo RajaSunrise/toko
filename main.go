@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -9,54 +10,67 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/streadway/amqp"
+	"github.com/spf13/viper"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 
 	"toko/internal/handlers"
+	"toko/internal/middleware"
 	"toko/internal/models"
 	"toko/internal/repositories"
 	"toko/internal/services"
 	"toko/pkg/rabbitmq"
-
-	"github.com/spf13/viper"
 )
 
-func main() {
+// NewApp creates and configures the Fiber application.
+// This function is designed to be callable from tests.
+func NewApp() (*fiber.App, *services.AuthService, error) {
 	// --- Configuration ---
 	// Set up Viper to read configuration from environment variables or a file
 	viper.SetDefault("APP_PORT", ":8080")
+	viper.SetDefault("DATABASE_DSN", "host=127.0.0.1 user=postgres password=postgres dbname=toko port=5432 sslmode=disable")
+	viper.SetDefault("JWT_SECRET", "supersecretjwtkey")
 	viper.SetDefault("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 	viper.AutomaticEnv() // Load environment variables
 
-	appPort := viper.GetString("APP_PORT")
+	databaseDSN := viper.GetString("DATABASE_DSN")
+	jwtSecret := viper.GetString("JWT_SECRET")
 	rabbitMQURL := viper.GetString("RABBITMQ_URL")
 
+	// --- Initialize Database (GORM) ---
+	db, err := gorm.Open(postgres.Open(databaseDSN), &gorm.Config{}) // Use postgres.Open
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Auto-migrate database schema
+	err = db.AutoMigrate(&models.Product{}, &models.User{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to auto-migrate database: %w", err)
+	}
+
+	// --- Initialize Repositories (using GORM) ---
+	productRepo := repositories.NewGORMProductRepository(db)
+	userRepo := repositories.NewGORMUserRepository(db)
+	orderRepo := repositories.NewMockOrderRepository() // Keep mock for now
+
 	// --- Initialize RabbitMQ Client ---
-	// Note: The RabbitMQ client needs to be properly managed, especially for connections.
-	// For simplicity, we initialize it here. In a larger app, consider a dedicated
-	// package for managing these resources.
 	mqConfig := rabbitmq.Config{URL: rabbitMQURL}
 	mqClient, err := rabbitmq.NewClient(mqConfig)
 	if err != nil {
 		log.Fatalf("Failed to initialize RabbitMQ client: %v", err)
 	}
-	defer mqClient.Close() // Ensure the connection is closed on exit
-
-	// --- Initialize Repositories (using mocks for now) ---
-	productRepo := repositories.NewMockProductRepository()
-	orderRepo := repositories.NewMockOrderRepository()
-
-	// Seed some mock data for products
-	seedProducts(productRepo)
+	defer mqClient.Close()
 
 	// --- Initialize Services ---
-	// ProductService depends on ProductRepository
 	productService := services.NewProductService(productRepo)
-	// OrderService depends on OrderRepository, ProductRepository, and RabbitMQClient
 	orderService := services.NewOrderService(orderRepo, productRepo, mqClient)
+	authService := services.NewAuthService(userRepo, jwtSecret)
 
 	// --- Initialize Handlers ---
 	productHandler := handlers.NewProductHandler(productService)
 	orderHandler := handlers.NewOrderHandler(orderService)
+	authHandler := handlers.NewAuthHandler(authService)
 
 	// --- Initialize Fiber App ---
 	app := fiber.New()
@@ -68,45 +82,42 @@ func main() {
 	// Group routes under /api/v1
 	apiV1 := app.Group("/api/v1")
 
+	// Authentication routes (public)
+	authHandler.RegisterRoutes(apiV1)
+
+	// Protected routes (require JWT authentication)
+	protectedRoutes := apiV1.Group("", middleware.AuthRequired(authService))
+
 	// Register product routes
-	productHandler.RegisterRoutes(apiV1)
+	productHandler.RegisterRoutes(protectedRoutes)
 	// Register order routes
-	orderHandler.RegisterRoutes(apiV1)
+	orderHandler.RegisterRoutes(protectedRoutes)
 
 	// --- Health Check Endpoint ---
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"status":  "healthy",
-			"time":    time.Now().Format(time.RFC3339),
-			"rabbitM": "connected", // Simple check, real check needs MQ ping
+			"status": "healthy",
+			"time":   time.Now().Format(time.RFC3339),
+			// "rabbitM": "connected", // Simple check, real check needs MQ ping
 		})
 	})
 
-	// --- Start RabbitMQ Consumer in a Goroutine ---
-	// This consumer will listen for order-related events.
-	// In a real app, you'd have more sophisticated error handling,
-	// connection recovery, and message processing logic.
-	go func() {
-		log.Println("Starting RabbitMQ consumer for orders...")
-		// Define how to handle incoming order messages
-		messageHandler := func(msg amqp.Delivery) error {
-			log.Printf("Received Order Event (Tag: %d): %s", msg.DeliveryTag, string(msg.Body))
-			// Here, you would parse the message (e.g., order details)
-			// and trigger business logic (e.g., update inventory, send email).
-			// For this example, we'll just simulate work.
-			time.Sleep(1 * time.Second) // Simulate processing time
+	return app, authService, nil
+}
 
-			// Manually acknowledge the message if processing was successful
-			// If an error occurs during processing, Nack the message to requeue or send to dead-letter queue
-			return nil // Return nil to acknowledge
-		}
-		if consumerErr := mqClient.ConsumeOrderEvents(messageHandler); consumerErr != nil {
-			log.Printf("Failed to start RabbitMQ consumer: %v", err)
-			// In a production system, you'd want to implement reconnection logic
-		}
-	}()
+// main is the entry point of the application.
+func main() {
+	app, _, err := NewApp()
+	if err != nil {
+		log.Fatalf("Failed to initialize application: %v", err)
+	}
 
-	// --- Start HTTP Server ---
+	// Retrieve the configured port, default to 8080 if not set
+	appPort := viper.GetString("APP_PORT")
+	if appPort == "" {
+		appPort = ":8080"
+	}
+
 	log.Printf("Starting server on port %s", appPort)
 
 	// Graceful shutdown handling
@@ -128,26 +139,21 @@ func main() {
 		log.Printf("Error during Fiber shutdown: %v", err)
 	}
 
-	// Close RabbitMQ connection is handled by defer in main
+	// Note: If RabbitMQ was active, its connection would also need to be closed here.
 	log.Println("Server gracefully stopped")
 }
 
-// seedProducts populates the mock product repository with some initial data.
+// seedProducts populates the product repository with some initial data.
 func seedProducts(repo repositories.ProductRepository) {
 	products := []models.Product{
-		{ID: "prod-1", Name: "Laptop", Description: "High performance laptop", Price: 1200.00, Stock: 10},
-		{ID: "prod-2", Name: "Keyboard", Description: "Mechanical keyboard", Price: 75.00, Stock: 25},
-		{ID: "prod-3", Name: "Mouse", Description: "Ergonomic wireless mouse", Price: 25.00, Stock: 50},
+		{Name: "Laptop", Description: "High performance laptop", Price: 1200.00, Stock: 10},
+		{Name: "Keyboard", Description: "Mechanical keyboard", Price: 75.00, Stock: 25},
+		{Name: "Mouse", Description: "Ergonomic wireless mouse", Price: 25.00, Stock: 50},
 	}
 
-	for i := range products {
-		// Using mock repository's Create, which handles ID generation if not provided
-		// For seeding, we explicitly set IDs to ensure consistency.
-		err := repo.Create(&products[i])
-		if err != nil {
-			log.Printf("Error seeding product %s: %v", products[i].Name, err)
-		} else {
-			log.Printf("Seeded product: %s (ID: %s)", products[i].Name, products[i].ID)
+	for _, product := range products {
+		if err := repo.Create(&product); err != nil {
+			log.Printf("Error seeding product: %v", err)
 		}
 	}
 }

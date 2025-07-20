@@ -1,29 +1,30 @@
 package services
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 	"toko/internal/models"
 	"toko/internal/repositories"
-	"toko/pkg/rabbitmq" // Assuming this path for RabbitMQ client
+	"toko/pkg/rabbitmq"
 
 	"github.com/google/uuid"
 )
 
 // OrderService handles business logic related to orders.
 type OrderService struct {
-	orderRepo      repositories.OrderRepository
-	productRepo    repositories.ProductRepository // Needed to check product availability/price
-	rabbitMQClient *rabbitmq.Client               // RabbitMQ client for publishing events
+	orderRepo   repositories.OrderRepository
+	productRepo repositories.ProductRepository
+	mqClient    *rabbitmq.Client // RabbitMQ client
 }
 
 // NewOrderService creates a new OrderService.
 func NewOrderService(orderRepo repositories.OrderRepository, productRepo repositories.ProductRepository, mqClient *rabbitmq.Client) *OrderService {
 	return &OrderService{
-		orderRepo:      orderRepo,
-		productRepo:    productRepo,
-		rabbitMQClient: mqClient,
+		orderRepo:   orderRepo,
+		productRepo: productRepo,
+		mqClient:    mqClient,
 	}
 }
 
@@ -94,15 +95,21 @@ func (s *OrderService) CreateOrder(orderRequest models.Order) (*models.Order, er
 	}
 
 	// Use the RabbitMQ client to publish the message
-	err = s.rabbitMQClient.PublishOrderCreated(orderCreatedMessage)
-	if err != nil {
-		// Log the error, but consider the order creation successful if it's in the DB.
-		// A robust system might implement retry mechanisms or dead-letter queues.
-		log.Printf("Warning: Failed to publish order created event for order %s: %v", newOrder.ID, err)
-		// Depending on business requirements, you might want to return an error here
-		// or proceed with the order creation but flag it for manual review.
+	if s.mqClient != nil {
+		messageBody, err := json.Marshal(orderCreatedMessage)
+		if err != nil {
+			log.Printf("Failed to marshal order to JSON: %v", err)
+		} else {
+			err = s.mqClient.Publish("order", "order.created", messageBody)
+			if err != nil {
+				log.Printf("Warning: Failed to publish order created event for order %s: %v", newOrder.ID, err)
+			} else {
+				log.Printf("Successfully published order created event for order %s", newOrder.ID)
+			}
+		}
+
 	} else {
-		log.Printf("Successfully published order created event for order %s", newOrder.ID)
+		log.Println("RabbitMQ client is not initialized. Skipping message publication.")
 	}
 
 	return newOrder, nil

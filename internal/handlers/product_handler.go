@@ -3,21 +3,25 @@ package handlers
 import (
 	"fmt"
 	"log"
+	"strings"
 	"toko/internal/models"
 	"toko/internal/services"
 
+	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
 )
 
 // ProductHandler handles HTTP requests for products.
 type ProductHandler struct {
-	service *services.ProductService
+	service  *services.ProductService
+	validate *validator.Validate
 }
 
 // NewProductHandler creates a new ProductHandler.
 func NewProductHandler(service *services.ProductService) *ProductHandler {
 	return &ProductHandler{
-		service: service,
+		service:  service,
+		validate: validator.New(),
 	}
 }
 
@@ -51,7 +55,7 @@ func (h *ProductHandler) HandleGetProductByID(c *fiber.Ctx) error {
 	if err != nil {
 		log.Printf("Error getting product by ID %s: %v", productID, err)
 		// Check if the error is because the product was not found
-		if err.Error() == fmt.Sprintf("product with ID %s not found", productID) {
+		if strings.Contains(err.Error(), "not found") { // More robust check
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"message": fmt.Sprintf("Product with ID %s not found", productID),
 			})
@@ -75,10 +79,17 @@ func (h *ProductHandler) HandleCreateProduct(c *fiber.Ctx) error {
 		})
 	}
 
-	// Basic validation: Name and Price are required
-	if product.Name == "" || product.Price <= 0 {
+	// Validate the product struct
+	if err := h.validate.Struct(product); err != nil {
+		// Handle validation errors
+		validationErrors := err.(validator.ValidationErrors)
+		errorMessages := make(map[string]string)
+		for _, e := range validationErrors {
+			errorMessages[e.Field()] = fmt.Sprintf("Field '%s' failed on the '%s' tag", e.Field(), e.Tag())
+		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"message": "Product name and price are required and price must be positive.",
+			"message": "Validation failed",
+			"errors":  errorMessages,
 		})
 	}
 
@@ -112,10 +123,18 @@ func (h *ProductHandler) HandleUpdateProduct(c *fiber.Ctx) error {
 	// Ensure the ID from the URL is used, not one from the request body
 	productUpdate.ID = productID
 
-	// Basic validation
-	if productUpdate.Name == "" || productUpdate.Price <= 0 {
+	// Validate the product struct for update
+	// Use h.validate.StructPartial if you only want to validate provided fields
+	// For now, we assume all fields are required for update as per struct tags.
+	if err := h.validate.Struct(productUpdate); err != nil {
+		validationErrors := err.(validator.ValidationErrors)
+		errorMessages := make(map[string]string)
+		for _, e := range validationErrors {
+			errorMessages[e.Field()] = fmt.Sprintf("Field '%s' failed on the '%s' tag", e.Field(), e.Tag())
+		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"message": "Product name and price are required and price must be positive.",
+			"message": "Validation failed",
+			"errors":  errorMessages,
 		})
 	}
 
@@ -123,7 +142,7 @@ func (h *ProductHandler) HandleUpdateProduct(c *fiber.Ctx) error {
 	if err != nil {
 		log.Printf("Error updating product with ID %s: %v", productID, err)
 		// Check if the error is because the product was not found
-		if err.Error() == fmt.Sprintf("product with ID %s not found for update", productID) {
+		if strings.Contains(err.Error(), "not found") { // More robust check
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"message": fmt.Sprintf("Product with ID %s not found", productID),
 			})
@@ -146,7 +165,7 @@ func (h *ProductHandler) HandleDeleteProduct(c *fiber.Ctx) error {
 	if err != nil {
 		log.Printf("Error deleting product with ID %s: %v", productID, err)
 		// Check if the error is because the product was not found
-		if err.Error() == fmt.Sprintf("product with ID %s not found for deletion", productID) {
+		if strings.Contains(err.Error(), "not found") { // More robust check
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"message": fmt.Sprintf("Product with ID %s not found", productID),
 			})

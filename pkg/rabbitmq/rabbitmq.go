@@ -4,9 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 
-	amqp "github.com/streadway/amqp"
+	"github.com/streadway/amqp"
 )
 
 // Client holds the RabbitMQ connection and channel.
@@ -79,117 +78,99 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// PublishOrderCreated publishes an order creation event to the 'order_queue'.
-// The message is marshaled to JSON.
-func (c *Client) PublishOrderCreated(orderData map[string]interface{}) error {
-	if c.channel == nil {
-		return fmt.Errorf("RabbitMQ channel is not available")
-	}
-
-	// Marshal the order data to JSON
-	body, err := json.Marshal(orderData)
+// Publish publishes a message to rabbitmq
+func (c *Client) Publish(exchange, routingKey string, body []byte) error {
+	ch, err := c.conn.Channel()
 	if err != nil {
-		return fmt.Errorf("failed to marshal order data to JSON: %w", err)
+		return fmt.Errorf("failed to open a channel: %w", err)
+	}
+	defer ch.Close()
+
+	err = ch.ExchangeDeclare(
+		exchange, // name
+		"direct", // type
+		true,     // durable
+		false,    // auto-deleted
+		false,    // internal
+		false,    // no-wait
+		nil,      // arguments
+	)
+	if err != nil {
+		return fmt.Errorf("failed to declare an exchange: %w", err)
 	}
 
-	// Publish the message to the 'order_queue'
-	err = c.channel.Publish(
-		"",          // exchange: default exchange
-		"order_queue", // routing key: the queue name
-		false,       // mandatory: if true, returns message if it cannot be routed
-		false,       // immediate: if true, returns message if it cannot be delivered to any consumer
+	err = ch.Publish(
+		exchange,   // exchange
+		routingKey, // routing key
+		false,      // mandatory
+		false,      // immediate
 		amqp.Publishing{
 			ContentType: "application/json",
 			Body:        body,
-			// You can add delivery mode, headers, expiration, etc. here
-			DeliveryMode: amqp.Persistent, // Make message persistent
-			Timestamp:    time.Now(),
 		})
-
 	if err != nil {
-		return fmt.Errorf("failed to publish message: %w", err)
+		return fmt.Errorf("failed to publish a message: %w", err)
 	}
 
-	log.Printf(" [x] Sent order event: %s", body)
 	return nil
 }
 
-// --- Consumer logic would go here ---
-// Example: ConsumeOrderEvents starts a goroutine to listen for messages on 'order_queue'.
-// In a real application, this would typically be run as a separate process or a dedicated consumer goroutine.
-func (c *Client) ConsumeOrderEvents(messageHandler func(msg amqp.Delivery) error) error {
-	if c.channel == nil {
-		return fmt.Errorf("RabbitMQ channel is not available for consumption")
+// ConsumeOrderEvents consumes order events
+func (c *Client) ConsumeOrderEvents(messageHandler func(amqp.Delivery) error) error {
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("failed to open a channel: %w", err)
 	}
+	defer ch.Close()
 
-	// Ensure the queue exists (it should have been declared by NewClient, but good practice to re-declare)
-	queue, err := c.channel.QueueDeclare(
-		"order_queue", // name
-		true,          // durable
-		false,         // delete when unused
-		false,         // exclusive
-		false,         // no-wait
-		nil,           // arguments
+	q, err := ch.QueueDeclare(
+		"orders", // name
+		false,    // durable
+		false,    // delete when unused
+		false,    // exclusive
+		false,    // no-wait
+		nil,      // arguments
 	)
 	if err != nil {
-		return fmt.Errorf("failed to declare queue for consuming: %w", err)
+		return fmt.Errorf("failed to declare a queue: %w", err)
 	}
 
-	// Start consuming messages
-	msgs, err := c.channel.Consume(
-		queue.Name, // queue
-		"",         // consumer tag: unique identifier for the consumer
-		false,      // auto-ack: set to false to manually acknowledge messages
-		false,      // exclusive
-		false,      // no-local
-		false,      // no-wait
-		nil,        // args
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
 	)
 	if err != nil {
-		return fmt.Errorf("failed to register consumer: %w", err)
+		return fmt.Errorf("failed to register a consumer: %w", err)
 	}
 
-	log.Printf(" [*] Waiting for order events. To exit press CTRL+C")
+	forever := make(chan bool)
 
-	// Start a goroutine to process messages
 	go func() {
-		for msg := range msgs {
-			log.Printf("Received a message: %v", msg.DeliveryTag)
-			// Process the message using the provided handler
-			if err := messageHandler(msg); err != nil {
-				log.Printf("Error processing message %d: %v", msg.DeliveryTag, err)
-				// Negative acknowledge the message to requeue it (or send to dead-letter queue)
-				// Be careful with requeueing to avoid infinite loops for unprocessable messages.
-				if requeueErr := msg.Nack(false, true); requeueErr != nil {
-					log.Printf("Error nacking message %d: %v", msg.DeliveryTag, requeueErr)
-				}
-			} else {
-				// Manually acknowledge the message upon successful processing
-				if ackErr := msg.Ack(false); ackErr != nil {
-					log.Printf("Error acking message %d: %v", msg.DeliveryTag, ackErr)
-				}
+		for d := range msgs {
+			err := messageHandler(d)
+			if err != nil {
+				log.Printf(" [ERROR] Failed to handle message: %v", err)
 			}
 		}
 	}()
 
+	log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
+	<-forever
+
 	return nil
 }
 
-// Example of a handler function that might be passed to ConsumeOrderEvents
-// This is just a placeholder and would be implemented by the application logic.
-func HandleOrderMessage(msg amqp.Delivery) error {
-	log.Printf("Processing order message: %s", string(msg.Body))
-	// Here you would parse the message body (e.g., order details)
-	// and perform actions like:
-	// - Update inventory
-	// - Send confirmation email/SMS
-	// - Trigger other workflows
+// PublishOrderCreated publishes the order created event
+func (c *Client) PublishOrderCreated(messageBody map[string]interface{}) error {
+	body, err := json.Marshal(messageBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %w", err)
+	}
 
-	// Simulate processing time
-	time.Sleep(2 * time.Second)
-
-	// If processing is successful, the message will be acknowledged.
-	// If an error occurs, the message will be NACKed and potentially requeued.
-	return nil // Returning nil indicates successful processing
+	return c.Publish("order", "order.created", body)
 }
-
